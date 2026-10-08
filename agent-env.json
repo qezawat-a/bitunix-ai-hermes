@@ -1,0 +1,18 @@
+{
+  "MAX_READ": 2000,
+  "MAX_WINDOW_RATE_LIMIT": 64,
+  "MAX_AGENT_STEPS": 64,
+  "AGENT_THOUGHT_BUDGET": 10000,
+  "AGENT_ACCESS_ADMIN": false,
+  "AGENT_TOOLS": [
+    "EDIT","WRITE","BASH","SH","PIP","READ","TaskCreate","TaskUpdate",
+    "WordSearch","WebFetch","WebSearch","Vision","Artifact","FileCreate",
+    "git","gh","TitleGeneration","AutoPermission"
+  ],
+  "source": "user-provided agent environment config (context)",
+  "notes": [
+    "AGENT_ACCESS_ADMIN controls whole-terminal/device access scope for the agent.",
+    "AGENT_TOOLS is the agent's toolset; BASH/SH give terminal access, WEB* give browsing.",
+    "Keep AGENT_ACCESS_ADMIN=false unless explicitly enabling device-wide access."
+  ]
+}
