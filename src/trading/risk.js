@@ -68,11 +68,15 @@ export function mmrFor(maxLeverage) {
  * Fees and funding are excluded here exactly as they are in the doc. They move
  * liquidation closer over time, which is why clampStopInsideLiq keeps a buffer.
  */
-export function estimateLiqPrice({ side, entry, leverage, mmr = 0.005 }) {
+export function estimateLiqPrice({ side, entry, leverage, mmr = 0.005, marginMode = 'CROSS' }) {
   const lev = Math.max(1, Number(leverage) || 1);
   const imr = 1 / lev;
   const e = Number(entry);
-  const liq = side === 'LONG' ? e * (1 - imr + Number(mmr)) : e * (1 + imr - Number(mmr));
+  const mm = String(marginMode || '').toUpperCase();
+  const isCross = mm === 'CROSS';
+  // Isolated formula (docs); CROSS needs account-wide distance correction.
+  const baseLiq = side === 'LONG' ? e * (1 - imr + Number(mmr)) : e * (1 + imr - Number(mmr));
+  const liq = isCross ? (side === 'LONG' ? e - (e - baseLiq) * 1.3 : e + (baseLiq - e) * 1.3) : baseLiq;
   // At leverage >= 1/MMR the maintenance requirement swallows the entire
   // margin and liquidation sits at or through entry. No stop survives that;
   // return entry so the caller refuses the trade.
