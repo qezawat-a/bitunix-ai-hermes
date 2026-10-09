@@ -64,22 +64,57 @@ export function mmrFor(maxLeverage) {
  * CROSS margin liquidates later than this, because the whole account balance
  * backs the position. Using the isolated formula for both modes therefore
  * under-states the distance to liquidation, which is the safe error to make.
+ * When the account balance and the position size are both known, the CROSS
+ * branch below substitutes the real per-unit backing into the SAME published
+ * form; the old code multiplied the isolated distance by 1.3, which was a
+ * guess that could go either way depending on the balance.
  *
  * Fees and funding are excluded here exactly as they are in the doc. They move
  * liquidation closer over time, which is why clampStopInsideLiq keeps a buffer.
  */
-export function estimateLiqPrice({ side, entry, leverage, mmr = 0.005, marginMode = 'CROSS' }) {
-  const lev = Math.max(1, Number(leverage) || 1);
-  const imr = 1 / lev;
+export function estimateLiqPrice({
+  side, entry, leverage, mmr = 0.005, marginMode = 'CROSS',
+  balance = null, qty = null,
+}) {
   const e = Number(entry);
+  const r = Number(mmr);
+  if (!(e > 0) || !(r >= 0 && r < 1)) return null;
+  const lev = Math.max(1, Number(leverage) || 1);
   const mm = String(marginMode || '').toUpperCase();
   const isCross = mm === 'CROSS';
-  // Isolated formula (docs); CROSS needs account-wide distance correction.
-  const baseLiq = side === 'LONG' ? e * (1 - imr + Number(mmr)) : e * (1 + imr - Number(mmr));
-  const liq = isCross ? (side === 'LONG' ? e - (e - baseLiq) * 1.3 : e + (baseLiq - e) * 1.3) : baseLiq;
-  // At leverage >= 1/MMR the maintenance requirement swallows the entire
-  // margin and liquidation sits at or through entry. No stop survives that;
-  // return entry so the caller refuses the trade.
+
+  // Liquidation is where equity meets the maintenance requirement:
+  //
+  //   long : M + Q(P - E) = r * Q * P
+  //   short: M + Q(E - P) = r * Q * P
+  //
+  // The exchange's published form is this equation with the margin term
+  // approximated, and it is what the liq engine actually approximates, so it
+  // is used in every branch rather than mixing in an exact solve. The only
+  // thing that differs between modes is perUnit -- the collateral standing
+  // behind one unit of size, as a fraction of entry:
+  //
+  //   ISOLATION: perUnit = 1 / lev. Leverage is the whole story, and the form
+  //              collapses to the published E(1 -+ 1/lev -+ MMR).
+  //   CROSS:     the entire account balance backs the position, so perUnit is
+  //              B/Q/E and leverage drops out. Own committed margin stays a
+  //              FLOOR -- the account can only be more secure than one
+  //              position's margin implies, never less.
+  const b = Number(balance) || 0;
+  const q = Number(qty) || 0;
+  const crossKnown = isCross && b > 0 && q > 0;
+  const perUnit = crossKnown ? Math.max(1 / lev, (b / q) / e) : 1 / lev;
+
+  // perUnit <= r: the maintenance requirement already swallows the collateral.
+  // Liquidation sits at or through entry and no stop can outrun it; collapse
+  // to entry so the caller refuses the trade.
+  if (perUnit <= r) return e;
+
+  // The published form, generalized to the real per-unit backing. One formula
+  // for every mode: the CROSS branch only ever EXTENDS the distance from the
+  // isolated baseline, never shortens it, so a CROSS position is never modelled
+  // as riskier than the same position isolated.
+  const liq = side === 'LONG' ? e * (1 - perUnit + r) : e * (1 + perUnit - r);
   if (side === 'LONG' && liq >= e) return e;
   if (side === 'SHORT' && liq <= e) return e;
   return liq;
@@ -138,15 +173,52 @@ export function clampStopInsideLiq({ side, entry, slPrice, liqPrice, buffer = nu
  * liquidation with the safety buffer intact. Used to refuse or de-lever a
  * trade instead of opening one that can only end in liquidation.
  */
-export function maxSafeLeverage({ entry, slDist, mmr = 0.005, buffer = null }) {
+export function maxSafeLeverage({
+  entry, slDist, mmr = 0.005, buffer = null,
+  marginMode = 'ISOLATION', cap = null,
+  // `side`/`balance`/`qty` are accepted so callers pass one uniform argument
+  // shape. The published liq form is side-independent, so side is not read
+  // here; balance/qty only matter for the CROSS branch.
+  side: _side = null, balance = null, qty = null,
+}) {
+  // No cap means "the caller did not set one", NOT "1x". Defaulting an absent
+  // cap to 1 would silently force every caller that omits it onto 1x leverage.
+  const ceiling = Number(cap) > 0 && Number.isFinite(Number(cap))
+    ? Number(cap) : Number.MAX_SAFE_INTEGER;
+  const e = Number(entry);
+  const r = Number(mmr);
+  if (!(e > 0) || !(r >= 0 && r < 1) || !(Number(slDist) > 0)) {
+    return Math.max(1, Math.floor(ceiling));
+  }
   if (buffer == null) buffer = Number(settings().liq_distance ?? 0.5);
   buffer = clamp(Number(buffer), 0.05, 0.9);
-  // Solve |entry - liq| >= slDist / (1 - buffer) for leverage, using the
-  // published liq formula: |entry - liq| = entry * (1/lev - MMR).
-  const needed = Number(slDist) / (1 - buffer);        // required liq distance
-  const frac = needed / Number(entry);                 // as a fraction of price
-  const lev = 1 / (frac + Number(mmr));
-  return Math.max(1, Math.floor(lev));
+
+  // Required entry->liq distance once the safety buffer is reserved.
+  const needed = Number(slDist) / (1 - buffer);
+  const mm = String(marginMode || 'ISOLATION').toUpperCase();
+  const b = Number(balance) || 0;
+  const q = Number(qty) || 0;
+
+  // CROSS with known backing: liquidation is set by the account balance, not
+  // by leverage, so there is no leverage to solve for. De-levering here would
+  // be a silent downgrade that fixes nothing -- the liq price barely moves,
+  // because it never depended on leverage in the first place.
+  if (mm === 'CROSS' && b > 0 && q > 0) return Math.max(1, Math.floor(ceiling));
+
+  // ISOLATION, and CROSS with unknown backing (isolated bound as the
+  // conservative stand-in). The published form gives
+  // |entry - liq| = entry * (1/lev - MMR) for BOTH sides, so solving
+  // |entry - liq| >= needed for lev is side-independent:
+  //
+  //   1/lev >= r + needed/E   ->   lev <= 1 / (r + needed/E)
+  //
+  // This deliberately does NOT use the exact-equity (1 -+ r) denominator: the
+  // estimator above uses the published form, and the solver has to agree with
+  // it or it would compute a "safe" leverage against a different liq price
+  // than the one the stop is later clamped against.
+  const frac = r + needed / e;
+  if (!(frac > 0)) return Math.max(1, Math.floor(ceiling));
+  return Math.max(1, Math.min(Math.floor(1 / frac), Math.floor(ceiling)));
 }
 
 /**
@@ -338,8 +410,15 @@ export function computeDynamicTpSl(signal) {
   const isLong = signal.side === 'LONG';
   const lev = Number(signal.leverage) || Number(s.leverage) || 1;
   const mmr = signal.mmr ?? mmrFor(signal.maxLeverage);
+  // The margin mode decides whether leverage even appears in the liq formula,
+  // so it has to reach both the estimate and the leverage solver below.
+  const marginMode = String(signal.marginMode || s.margin_mode || 'CROSS').toUpperCase();
   const liqPrice = signal.liqPrice
-    ?? estimateLiqPrice({ side: signal.side, entry: price, leverage: lev, mmr });
+    ?? estimateLiqPrice({
+      side: signal.side, entry: price, leverage: lev, mmr, marginMode,
+      balance: Number(signal.accountBalance) || null,
+      qty: Number(signal.qty) || null,
+    });
   let liqAdjusted = false;
   let liqNote = null;
   // liq at/through entry: the position is unopenable at this leverage
@@ -386,7 +465,15 @@ export function computeDynamicTpSl(signal) {
     tpBasis = `fixed ${rr.toFixed(2)}R`;
   }
   const tpDist = tpPrice == null ? null : Math.abs(tpPrice - price);
-  const safeLev = maxSafeLeverage({ entry: price, slDist: atr * kSl, mmr });
+  // The cap is the exchange's own max for this pair: the solver may never
+  // recommend MORE than the account can take. Without it the absent-cap
+  // default (MAX_SAFE_INTEGER) would read as "unbounded".
+  const safeLev = maxSafeLeverage({
+    entry: price, slDist: atr * kSl, mmr, marginMode, side: signal.side,
+    cap: Number(signal.maxLeverage) || null,
+    balance: Number(signal.accountBalance) || null,
+    qty: Number(signal.qty) || null,
+  });
 
   return {
     slPrice,

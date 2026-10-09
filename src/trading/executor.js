@@ -128,29 +128,49 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   const info = await bitunix.pairInfo(symbol);
   let leverage = Math.max(Number(info?.minLeverage ?? 1),
     Math.min(Number(info?.maxLeverage ?? MAX_LEVERAGE), Number(s.leverage)));
+  // What the signal/settings asked for, captured before any exchange limit or
+  // guard touches it, so a filled position always reports the difference.
+  const leverageRequested = Number(s.leverage) || 1;
 
-  // ---- de-lever so the ATR stop fits inside liquidation -----------------
-  // The stop distance comes from ATR and does not shrink when leverage grows,
-  // but the liquidation price marches toward entry as leverage grows. Past a
-  // certain leverage the stop sits BEYOND liq and the position can only ever
-  // be liquidated. Rather than open that trade, cut the leverage to fit.
+  // ---- margin mode: it decides which liq formula applies -----------------
+  //
+  // ISOLATION moves the liquidation price with leverage; CROSS moves it with
+  // the account balance standing behind the position, and leverage drops out.
+  // Reading this from settings alone was wrong — the exchange's own mode is
+  // what decides the physics, and a settings/exchange mismatch would size the
+  // whole bracket against the wrong formula without any signal that it had.
+  let marginMode = String(s.margin_mode || 'CROSS').toUpperCase();
+  try {
+    const lm = await bitunix.getLeverageAndMarginMode(symbol);
+    if (lm?.marginMode) marginMode = String(lm.marginMode).toUpperCase();
+  } catch (e) {
+    log.warn(`${symbol}: margin mode unreadable (${e.message}); assuming ${marginMode}`);
+  }
+
+  // Every leverage change from here down is recorded, never applied silently.
+  const adjustments = [];
+
+  // ---- the exchange's own leverage limit (a limit, not a downgrade) -------
+  //
+  // Both the maintenance margin rate AND the maximum leverage depend on the
+  // position's notional value, so a big position on a thin pair silently loses
+  // access to high leverage. Ask the exchange rather than guessing:
+  // get_position_tiers is authoritative. This is an exchange limit being
+  // respected, not the bot deciding the trade is too hot — it is surfaced as
+  // an adjustment rather than booked as the requested leverage.
   {
     const maxLev = Number(info?.maxLeverage);
 
-    // Risk tier lookup. Both the maintenance margin rate AND the maximum
-    // leverage depend on the position's notional value, so a big position on
-    // a thin pair silently loses access to high leverage. Ask the exchange
-    // rather than guessing: get_position_tiers is authoritative.
     let mmr = null;
     try {
       const tier = await bitunix.tierFor({ symbol, notional: marginUsdt * leverage });
       mmr = tier.mmr;
       if (tier.leverage < leverage) {
         log.warn(`${symbol}: tier L${tier.level} (notional up to ${tier.endValue}) caps leverage at ${tier.leverage}x, requested ${leverage}x`);
-        await logEvent('leverage_reduced', {
-          symbol, requested: leverage, applied: tier.leverage,
+        adjustments.push({
+          kind: 'tier_cap', from: leverage, to: tier.leverage,
           reason: `risk tier L${tier.level} maximum`, tier,
-        }, symbol);
+        });
         leverage = tier.leverage;
         await ensureSymbolConfig(symbol, leverage);
       }
@@ -158,26 +178,42 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
       log.warn(`${symbol}: position tiers unavailable (${e.message}); falling back to the maxLeverage heuristic`);
     }
 
-    const probe = computeDynamicTpSl({ ...signal, price, leverage: 1, maxLeverage: maxLev, mmr });
-    const atLev = computeDynamicTpSl({ ...signal, price, leverage, maxLeverage: maxLev, mmr });
+    // The size this trade is about to take. CROSS liquidation depends on how
+    // much of the account stands behind one unit, so the intended qty is part
+    // of the liquidation estimate, not an afterthought.
+    const intendedQty = price > 0 ? (Number(marginUsdt) * leverage) / price : 0;
+
+    const probe = computeDynamicTpSl({
+      ...signal, price, leverage: 1, maxLeverage: maxLev, mmr,
+      marginMode, accountBalance: bal.available, qty: intendedQty,
+    });
+    const atLev = computeDynamicTpSl({
+      ...signal, price, leverage, maxLeverage: maxLev, mmr,
+      marginMode, accountBalance: bal.available, qty: intendedQty,
+    });
     if (atLev.liqUnsafe) {
-      return { ok: false, reason: `refusing ${symbol}: at ${leverage}x liquidation sits at the entry price` };
+      return {
+        ok: false,
+        reason: `refusing ${symbol}: at ${leverage}x (${marginMode}) liquidation sits at the entry price`,
+      };
     }
     const safeLev = probe.maxSafeLeverage;
     if (safeLev < leverage) {
-      const floor = Math.max(Number(info?.minLeverage ?? 1), Number(s.min_leverage ?? 1));
-      const cut = Math.max(floor, Math.min(leverage, safeLev));
-      log.warn(`${symbol}: ${leverage}x would liquidate before the ${probe.slPct}% stop; using ${cut}x`);
-      await logEvent('leverage_reduced', {
-        symbol, requested: leverage, applied: cut, stopPct: probe.slPct, reason: 'stop beyond liquidation',
+      // REFUSE, do not cut. A signal sized for 50x that gets booked at 7x is a
+      // different trade with a different risk profile, reported to the user as
+      // the one they asked for. In CROSS this branch is unreachable whenever
+      // the account backing is known — the solver returns the exchange cap,
+      // because leverage is not what sets a CROSS liquidation price.
+      await logEvent('position_refused_leverage', {
+        symbol, side: signal.side, requested: leverage, maxSafe: safeLev,
+        stopPct: probe.slPct, marginMode,
+        reason: 'stop would sit beyond liquidation at the requested leverage',
       }, symbol);
-      if (safeLev < floor) {
-        return { ok: false, reason: `refusing ${symbol}: even ${floor}x liquidates before a ${probe.slPct}% ATR stop` };
-      }
-      leverage = cut;
-      // the exchange must agree, otherwise qty and liq are computed off a
-      // leverage the position does not actually have
-      await ensureSymbolConfig(symbol, leverage);
+      return {
+        ok: false,
+        reason: `refusing ${symbol}: at ${leverage}x (${marginMode}) the ${probe.slPct}% ATR stop sits `
+          + `beyond liquidation — safe limit is ${safeLev}x. Lower leverage or widen the stop timeframe.`,
+      };
     }
   }
 
@@ -195,6 +231,12 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   // is targeting, so that is what is checked here: the ATR stop has to be
   // worth at least `min_cost_multiple` round trips, or the trade cannot pay
   // for itself no matter where it closes.
+  //
+  // That last sentence is also why the only honest outcome here is a refusal.
+  // Both the stop distance and the round-trip fee are proportional to
+  // notional, so their ratio is invariant under leverage — the old code
+  // computed a `cutTo` that solves for a leverage leaving the ratio exactly
+  // where it already was, i.e. a downgrade that fixed nothing.
   const minCostMultiple = Number(s.min_stop_cost_multiple ?? 3);
   const atrAbs = Math.abs(Number(signal?.atr) || 0);
   if (Number.isFinite(minCostMultiple) && minCostMultiple > 0 && atrAbs > 0) {
@@ -202,29 +244,16 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
     const roundTrip = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
     const multiple = stopPct / (roundTrip || 1);
     if (multiple < minCostMultiple) {
-      // Do not silently open a trade that cannot pay. Either de-lever until
-      // the ATR stop is proportionally larger than the fixed costs, or refuse.
-      const cutTo = Math.max(1, Math.ceil(roundTrip * minCostMultiple * (price / atrAbs)));
-      const deLev = Math.min(leverage, cutTo);
-      if (deLev < Number(info?.minLeverage ?? 1) || deLev >= leverage) {
-        await logEvent('position_refused_unviable', {
-          symbol, side: signal.side, leverage, marginUsdt: Number(marginUsdt),
-          stopPct, roundTrip, multiple, reason: 'ATR stop too small to cover the round trip',
-        }, symbol);
-        return {
-          ok: false,
-          reason: `refusing ${symbol}: the ${(stopPct * 100).toFixed(4)}% ATR stop is only `
-            + `${multiple.toFixed(1)}x the ${(roundTrip * 100).toFixed(3)}% round trip — `
-            + `needs ${minCostMultiple}x. Lower leverage or a wider timeframe.`,
-        };
-      }
-      log.warn(`${symbol}: ${leverage}x makes the ${(stopPct * 100).toFixed(4)}% ATR stop worth `
-        + `only ${multiple.toFixed(1)}x the round trip — cutting to ${deLev}x`);
-      await logEvent('leverage_reduced_cost_ratio', {
-        symbol, requested: leverage, applied: deLev, stopPct, roundTrip, multiple,
+      await logEvent('position_refused_unviable', {
+        symbol, side: signal.side, leverage, marginUsdt: Number(marginUsdt),
+        stopPct, roundTrip, multiple, reason: 'ATR stop too small to cover the round trip',
       }, symbol);
-      leverage = deLev;
-      await ensureSymbolConfig(symbol, leverage);
+      return {
+        ok: false,
+        reason: `refusing ${symbol}: the ${(stopPct * 100).toFixed(4)}% ATR stop is only `
+          + `${multiple.toFixed(1)}x the ${(roundTrip * 100).toFixed(3)}% round trip — `
+          + `needs ${minCostMultiple}x. Widen the stop timeframe or lower min_stop_cost_multiple.`,
+      };
     }
   }
 
@@ -395,6 +424,8 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   await setCooldown(symbol, Number(s.cooldown_min), 'opened position');
   await logEvent('position_opened', {
     symbol, side: signal.side, qty, price, marginUsdt, leverage,
+    leverageRequested, leverageApplied: leverage,
+    marginMode, adjustments,
     tpPrice, slPrice, rr: risk.rr, confidence: signal.confidence,
     agreement: signal.agreement, orderId: res?.orderId, positionId,
   }, symbol);
@@ -402,6 +433,8 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   return {
     ok: true, tradeId, positionId, orderId: res?.orderId, clientId,
     symbol, side: signal.side, qty: filledQty, price, leverage,
+    leverageRequested, leverageApplied: leverage,
+    marginMode, adjustments,
     marginUsdt: sized.cost, nominalUsdt: sized.nominal, orderUnit: unit,
     tpPrice: tpPrice == null ? null : Number(tpPrice), slPrice: Number(slPrice), risk, ladder,
   };

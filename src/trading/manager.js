@@ -171,29 +171,60 @@ export async function manageOpenPositions({ notify = null } = {}) {
     const pid = String(p.positionId);
     const record = await tradeByPosition(pid);
 
-    // candles for ATR
-    let atr = null, price = Number(p.avgOpenPrice);
-    try {
-      // Same rule as the scanner: the fallback is the configured default, not a
-      // stale copy of it. The first timeframe is the execution one — it still
-      // fixes the PRICE here; stop SIZING now goes through stopAtrFor.
-      const tf = String(s.timeframes || config.defaults.timeframes).split(',')[0].trim();
-      const candles = await getCandles(p.symbol, tf, 220);
-      atr = I.last(I.atr(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), 14));
-      price = I.last(candles.map((c) => c.close));
-    } catch {}
+    // ---- ONE candle pass: live price + every timeframe's ATR ----------------
+    //
+    // This was TWO loops over the same timeframe list: the first fetched the
+    // execution TF to set `price` plus an ATR that nothing read any more, the
+    // second walked the whole list again for stopAtrFor. Every timeframe is now
+    // fetched exactly once.
+    //
+    // The price also moved. It was the last CLOSED candle's close — a bar old
+    // by construction — while every stop this guard writes is a MARK_PRICE
+    // trigger (tpsl.js applyPositionTpSl). Trailing against a closed bar means
+    // the stop always chases the previous candle and reads as "stuck" while a
+    // winner runs, so the live mark wins and the entry is the last resort.
+    //
+    // And the failure is no longer swallowed by a bare `catch {}`. It left
+    // `atr` null and `price` on the entry, which switched breakeven AND
+    // trailing off for that position on that pass with nothing logged anywhere
+    // — one failed kline request, invisibly, and the guard reported all-clear.
+    const tfList = String(s.timeframes || config.defaults.timeframes)
+      .split(',').map((x) => x.trim()).filter(Boolean);
+    const execTf = tfList[0];
+
+    let atr = null;
+    let price = Number(p.markPrice || p.lastPrice || p.entryPrice || 0);
+    if (!(price > 0)) price = Number(p.avgOpenPrice) || 0;   // last resort: the entry
 
     // Per-TF ATRs, so the guard sizes stops with the SAME structure-TF policy
     // as the executor (stopAtrFor). Trailing on the execution-TF ATR was
     // fee-band too: "trailing 0.5 ATR" of a 1m bar is a fraction of a cent of
     // price — tighter than the round trip it is supposed to trail.
-    let tframes = {};
-    for (const t of String(s.timeframes || config.defaults.timeframes).split(',').map((x) => x.trim()).filter(Boolean)) {
+    const tframes = {};
+    for (const t of tfList) {
+      let cs;
       try {
-        const cs = await getCandles(p.symbol, t, 220);
-        const a = I.last(I.atr(cs.map((c) => c.high), cs.map((c) => c.low), cs.map((c) => c.close), 14));
-        if (Number.isFinite(a) && a > 0) tframes[t] = { atr: a };
-      } catch {}
+        cs = await getCandles(p.symbol, t, 220);
+        if (!Array.isArray(cs) || !cs.length) throw new Error('empty series');
+      } catch (e) {
+        log.warn(`${p.symbol}: no candles for ${t} (${e.message}) — `
+          + (t === execTf
+            ? 'price stays on the exchange mark'
+            : 'this timeframe cannot size a stop'));
+        continue;
+      }
+      const closes = cs.map((c) => c.close);
+      const a = I.last(I.atr(cs.map((c) => c.high), cs.map((c) => c.low), closes, 14));
+      if (!(Number.isFinite(a) && a > 0)) continue;
+      tframes[t] = { atr: a };
+      if (t === execTf) {
+        atr = a;
+        // used only when the position row carried no live mark
+        if (!(price > 0)) {
+          const close = Number(I.last(closes));
+          if (close > 0) price = close;
+        }
+      }
     }
     const stopPick = stopAtrFor({ atr, timeframes: tframes }, s);
 
@@ -230,15 +261,23 @@ export async function manageOpenPositions({ notify = null } = {}) {
       log.warn(`${p.symbol}: cannot read TP/SL (${e.message}) — leaving the existing one alone`);
       tpsl = null;
     }
-    if (tpsl && !tpsl.length && atr) {
+    // The ATR that sizes a rescue stop is the SAME one stopAtrFor picked, not
+    // the execution-TF ATR: a stop sized on the 1m bar is tighter than the
+    // round trip it is meant to survive.
+    const rescueAtr = Number(stopPick?.atr || atr || 0);
+    if (tpsl && !tpsl.length && rescueAtr) {
       const synth = computeDynamicTpSl({
-        symbol: p.symbol, side: p.side, price: Number(p.avgOpenPrice) || price, atr,
+        symbol: p.symbol, side: p.side, price: Number(p.avgOpenPrice) || price, atr: rescueAtr,
         timeframes: tframes,
         confidence: Number(record?.confidence || s.min_confidence),
         agreement: Number(record?.agreement || s.min_agreement),
-        atrPct: (atr / price) * 100, regime: 'RANGE',
+        atrPct: (rescueAtr / price) * 100, regime: 'RANGE',
         leverage: Number(p.leverage) || null,
         maxLeverage: Number((await bitunix.pairInfo(p.symbol))?.maxLeverage) || null,
+        // The mode the position actually opened in, so the liq clamp below
+        // applies the right physics. A CROSS position clamped by the isolated
+        // formula gets a stop pulled in for no reason.
+        marginMode: String(p.marginMode || s.margin_mode || 'CROSS').toUpperCase(),
         // real maintenance margin rate for this position's notional
         mmr: await bitunix.tierFor({
           symbol: p.symbol,
@@ -264,8 +303,24 @@ export async function manageOpenPositions({ notify = null } = {}) {
       continue;
     }
 
+    // Naked AND unsizable: the worst state this loop can be in, and the one
+    // that used to pass in silence. Logged on EVERY pass, not just the first,
+    // so it can never be mistaken for a stale sighting.
+    if (tpsl && !tpsl.length && !rescueAtr) {
+      log.warn(`${p.symbol} ${p.side}: NAKED and no ATR available to size a stop `
+        + `(${pid}) — every configured timeframe failed to load. This position has NO stop.`);
+    }
+
     // 2) breakeven + trailing
-    if (atr && p.roi > 0) {
+    //
+    // Gated on PRICE, not on ATR. That switch WAS the bug: `atr` came out of
+    // try/catch blocks that swallowed their errors, so one failed kline fetch
+    // switched breakeven and trailing off for that position with nothing
+    // logged — while breakeven in ATR mode is decided by breakeven_threshold
+    // alone and needs no ATR whatsoever. Only the giveback half needs one, and
+    // risk.js handles atr = 0 correctly: trailUsable goes false and breakeven
+    // plus profit-lock keep running.
+    if (price > 0 && p.roi > 0) {
       // method 3: two trailing families.
       //   ATR              — the original: breakeven, then a stop N ATR behind.
       //   RATIO / INTERVAL — the exchange's own semantics (help centre id=290):
@@ -276,11 +331,16 @@ export async function manageOpenPositions({ notify = null } = {}) {
       const tm = String(s.trailing_method || 'ATR').toUpperCase();
       let trail = null;
       if (tm === 'ATR') {
+        // structure-TF ATR (stopAtrFor): trailing on the 1m bar is
+        // fee-band — the stop barely ratchets and hands the win back.
+        const trailAtr = Number(stopPick?.atr || atr || 0);
+        if (!(trailAtr > 0)) {
+          log.warn(`${p.symbol} ${p.side}: ATR trailing with no ATR (${pid}) — `
+            + 'giveback is skipped, breakeven and profit-lock still run');
+        }
         trail = trailingStop({
           side: p.side, entry: Number(p.avgOpenPrice), currentPrice: price,
-          // structure-TF ATR (stopAtrFor): trailing on the 1m bar is
-          // fee-band — the stop barely ratchets and hands the win back.
-          atr: stopPick?.atr || atr, roiPct: p.roi, leverage: Number(p.leverage),
+          atr: trailAtr, roiPct: p.roi, leverage: Number(p.leverage),
           // the exchange's own liquidation price — authoritative, unlike an estimate
           liqPrice: Number(p.liqPrice) || null,
         });

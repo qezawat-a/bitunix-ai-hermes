@@ -270,8 +270,10 @@ export const TOOLS = [
   {
     name: 'set_position_tpsl',
     description: 'LIVE: place or modify the position-level TP/SL (market close on trigger). '
-      + 'Pass force=true to write a level the user chose by hand — the ratchet otherwise '
-      + 'protects whatever the engine last wrote, and will put that back over a manual change.',
+      + 'The stop ratchet compares against the level the EXCHANGE is holding, so a level the '
+      + 'user moved by hand is already protected from the engine overwriting it. Pass force=true '
+      + 'only to deliberately override the ratchet and loosen a stop — that is the one path that '
+      + 'bypasses the guard, so use it when the user has asked for a specific level.',
     danger: true,
     parameters: {
       type: 'object',
