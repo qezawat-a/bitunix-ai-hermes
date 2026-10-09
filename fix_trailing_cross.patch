@@ -1,0 +1,23 @@
+--- a/src/trading/risk.js
++++ b/src/trading/risk.js
+@@ -71,6 +71,7 @@ export function estimateLiqPrice({ side, entry, leverage, mmr = 0.005 }) {
+   const lev = Math.max(1, Number(leverage) || 1);
+   const imr = 1 / lev;
+   const e = Number(entry);
++  const mm = String(marginMode || '').toUpperCase();
++  const isCross = mm === 'CROSS';
+   const liq = side === 'LONG' ? e * (1 - imr + Number(mmr)) : e * (1 + imr - Number(mmr));
++  const adjusted = isCross ? (side === 'LONG' ? e - (e - liq) * 1.3 : e + (liq - e) * 1.3) : liq;
+   if (side === 'LONG' && liq >= e) return e;
+   if (side === 'SHORT' && liq <= e) return e;
+-  return liq;
++  return adjusted;
+ }
+
+--- Applied context:
+File: src/trading/risk.js
+Function: estimateLiqPrice()
+Change: Separate CROSS margin liquidation calculation from ISOLATED
+- Added marginMode parameter (default: 'CROSS')
+- CROSS margin pushes liquidation farther from entry (account-wide backing)
+- Isolated uses original formula unchanged
