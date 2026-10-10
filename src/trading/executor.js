@@ -283,7 +283,6 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   // notional, so their ratio is invariant under leverage — the old code
   // computed a `cutTo` that solves for a leverage leaving the ratio exactly
   // where it already was, i.e. a downgrade that fixed nothing.
-  const minCostMultiple = Number(s.min_stop_cost_multiple ?? 3);
   const atrAbs = Math.abs(Number(signal?.atr) || 0);
 
   // ---- the cost floor the ratio check above cannot see -----------------
@@ -344,22 +343,26 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
     };
   }
 
-  if (Number.isFinite(minCostMultiple) && minCostMultiple > 0 && atrAbs > 0) {
-    const stopPct = atrAbs / price;
-    const roundTrip = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
-    const multiple = stopPct / (roundTrip || 1);
-    if (multiple < minCostMultiple) {
-      await logEvent('position_refused_unviable', {
-        symbol, side: signal.side, leverage, marginUsdt: Number(marginUsdt),
-        stopPct, roundTrip, multiple, reason: 'ATR stop too small to cover the round trip',
-      }, symbol);
-      return {
-        ok: false,
-        reason: `refusing ${symbol}: the ${(stopPct * 100).toFixed(4)}% ATR stop is only `
-          + `${multiple.toFixed(1)}x the ${(roundTrip * 100).toFixed(3)}% round trip — `
-          + `needs ${minCostMultiple}x. Widen the stop timeframe or lower min_stop_cost_multiple.`,
-      };
-    }
+  // The ATR stop is still MEASURED against the round trip, but it no longer
+  // refuses. Removed at the user's instruction: as a scalper on 1m/3m the ATR
+  // stop is small by construction, so a ratio floor refused nearly everything
+  // and the bot stopped trading. A guard that blocks the strategy is not a
+  // guard, it is a kill switch with a technical name.
+  //
+  // What replaces it is visibility rather than a veto: the multiple is recorded
+  // on the position and surfaced in the Telegram history, so a trade whose
+  // stop could not have covered its own costs is visible as exactly that
+  // instead of being silently taken or silently blocked.
+  const stopPct = atrAbs > 0 && price > 0 ? atrAbs / price : null;
+  const roundTrip = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
+  const costMultiple = stopPct != null ? stopPct / (roundTrip || 1) : null;
+  if (costMultiple != null && costMultiple < 1) {
+    // Below 1.0 the stop is narrower than the cost of trading it: a winning
+    // move of that size still books a loss. Worth saying out loud, never worth
+    // blocking.
+    log.warn(`${symbol} ${signal.side}: ATR stop is ${costMultiple.toFixed(2)}x the `
+      + `round trip - a full stop-out costs more than the stop is wide. `
+      + `Trading it anyway per configuration; consider a wider timeframe.`);
   }
 
   // The sizing engine always produces a USDT figure to commit (marginUsdt).
@@ -533,6 +536,10 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
     // How the size was actually decided, so a capped trade is distinguishable
     // in the record from one that was sized this way to begin with.
     marginRequested, marginApplied: Number(marginUsdt), marginCapped,
+    // ATR stop as a multiple of the round-trip cost. Below 1.0 the stop is
+    // narrower than trading it, and that is worth seeing in the record now
+    // that it no longer blocks the trade.
+    costMultiple, roundTrip, feeBudgetPct,
     marginMode, adjustments,
     tpPrice, slPrice, rr: risk.rr, confidence: signal.confidence,
     agreement: signal.agreement, orderId: res?.orderId, positionId,

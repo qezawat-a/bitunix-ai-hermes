@@ -182,10 +182,12 @@ export const config = {
     // inside the taker round-trip fee band can never pay (2026-10-07:
     // 1m-scaled SLs at 0.09% of price on a 0.08-0.10% round trip).
     min_stop_pct: num(process.env.MIN_STOP_PCT, 0.25),
-    // How many round trips (fees + slippage) the ATR stop must be worth
-    // before a trade is opened. Below this the position cannot pay for
-    // itself no matter where it closes. 0 disables the refusal.
-    min_stop_cost_multiple: num(process.env.MIN_STOP_COST_MULTIPLE, 3),
+    // RETIRED. The ATR-stop-to-round-trip ratio is still computed and logged, but
+    // it no longer refuses a trade: as a scalper on 1m/3m the ATR stop is small
+    // by construction, so a ratio floor blocked nearly every signal and the bot
+    // stopped trading. Kept at 0 so it survives a DB reset as disabled rather
+    // than coming back as 3.
+    min_stop_cost_multiple: num(process.env.MIN_STOP_COST_MULTIPLE, 0),
     account_tp_usdt: num(process.env.ACCOUNT_TP_USDT, 0),                      // 0 = off
     account_sl_usdt: num(process.env.ACCOUNT_SL_USDT, 0),                      // 0 = off
     // Safety gap kept between the stop and the liquidation price, as a
