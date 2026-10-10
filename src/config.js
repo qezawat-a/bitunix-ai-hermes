@@ -168,9 +168,14 @@ export const config = {
     // All the other cost checks are fractions of notional and so are blind to
     // balance size; on a small account that blindness is the whole problem.
     // Measured 2026-10-09: 0.058 USDT per round trip against a 1.40 USDT
-    // balance = 4.1% of the account burned before any profit. Set to 1, a
-    // normal 50x scalping position is refused outright at this balance, which
-    // is the correct answer - see the refusal message for what to change.
+    // balance = 4.1% of the account burned before any profit.
+    //
+    // This SIZES the position DOWN to fit the budget, it does not refuse it.
+    // It used to refuse: at 1% of a 1.40 balance the budget (0.014 USDT) was
+    // below the ~0.058 USDT minimum round trip, so every trade was rejected -
+    // a bot that never trades looks prudent while earning nothing, which is the
+    // worst possible failure here. Kept at 1 (not the executor's 0.5 fallback,
+    // which never applies because this seed is always present in settings).
     max_fee_pct_of_balance: num(process.env.MAX_FEE_PCT_OF_BALANCE, 1),
     // --- the four TP/SL methods (help centre id=290) ---
     tp_mode: str(process.env.TP_MODE, 'ADAPTIVE').toUpperCase(),                 // ADAPTIVE | FIXED_R

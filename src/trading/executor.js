@@ -319,8 +319,11 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   const roundTripPct = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
   const balanceForCosts = Number(bal.available);
   // Share of the BALANCE one round trip may cost. Small by design: it is the
-  // margin of safety that keeps profit larger than cost.
-  const feeBudgetPct = Number(s.max_fee_pct_of_balance ?? 0.5);
+  // margin of safety that keeps profit larger than cost. The fallback matches
+  // the seed in config.js on purpose — the two used to disagree (1 vs 0.5), and
+  // since the seed is always present in settings the 0.5 never applied, so
+  // reading it here only misstated what the live budget actually was.
+  const feeBudgetPct = Number(s.max_fee_pct_of_balance ?? 1);
   if (Number.isFinite(feeBudgetPct) && feeBudgetPct > 0
       && balanceForCosts > 0 && roundTripPct > 0 && leverage > 0) {
     const maxNotional = (balanceForCosts * (feeBudgetPct / 100)) / roundTripPct;
