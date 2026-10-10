@@ -160,19 +160,45 @@ export class MarketFeed extends EventEmitter {
 
   /**
    * Subscribe a symbol's public channels: its 24h ticker plus one kline
-   * series. The public WS is per-symbol only. Kline channel names use the
-   * "min" suffix for minute timeframes (market_kline_1min, verified live;
-   * the short form market_kline_1m returns an empty ack and nothing else),
-   * so minute TFs are translated and anything else is sent verbatim.
+   * series. The public WS is per-symbol only.
+   *
+   * Kline channel names must match the exchange gateway: minutes need the `min`
+   * suffix (market_kline_1min works, market_kline_1m is a silent empty ack);
+   * days/weeks need the long forms (market_kline_1day, market_kline_3day,
+   * market_kline_1week deliver data — market_kline_1d/3d/1w are silently
+   * ignored); hours go verbatim (2h/4h/6h/12h work; market_kline_1h has never
+   * delivered a bar on this gateway). Per the WS docs, switching to a new
+   * interval requires unsubscribing the old channel FIRST, so we track the
+   * previous kline channel and clean it up before resubscribing.
    */
+  _lastWS = { ch: null, symbols: new Set() };
+
   watchSymbols(symbols, interval = '1m') {
+    const map = {
+      '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min',
+      '1h':'1h','2h':'2h','4h':'4h','6h':'6h','8h':'8h','12h':'12h',
+      '1d':'1day','3d':'3day','1w':'1week','1M':'1M',
+    };
+    const ch = map[String(interval)] ?? String(interval);
+
+    // Unsubscribe the previous interval's kline channels before resubscribing
+    // (per Bitunix WS docs — same channel cannot be re-subscribed under a new
+    // interval without an explicit unsubscribe first). Only when we have an
+    // active previous channel and the interval actually changed.
+    if (this._lastWS.ch && this._lastWS.ch !== ch) {
+      for (const s of this._lastWS.symbols) {
+        this.pub.unsubscribe({ symbol: s, ch: this._lastWS.ch });
+      }
+    }
+
     const list = [];
     for (const s of symbols) {
       list.push({ symbol: s, ch: 'ticker' });
-      const ch = String(interval).replace(/^(\d+)m$/, '$1min');
       list.push({ symbol: s, ch: `market_kline_${ch}` });
     }
     this.pub.subscribe(list);
+    this._lastWS.ch = ch;
+    this._lastWS.symbols = new Set(symbols);
     return this;
   }
 

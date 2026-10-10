@@ -104,13 +104,12 @@ export class BitunixClient {
   // NOTE: the public docs omit 3m, but the endpoint serves it — verified live
   // (bars exactly 180s apart, a distinct series from 5m). An unsupported
   // interval returns code 0 with an EMPTY data array, never an error.
-  // The official SDK's KlineRequest names this field klineType (LAST_PRICE |
-  // MARK_PRICE), not type. Probing shows the endpoint currently ignores both
-  // spellings — the same series comes back either way — but send the name the
-  // SDK uses so this keeps working if they wire it up.
-  getKline({ symbol, interval, limit = 200, startTime, endTime, klineType }) {
+  // Per the docs page the kline-type param is named `type` (LAST_PRICE |
+  // MARK_PRICE). Probing shows the exchange currently ignores the value and
+  // returns the last-price series either way — but use the documented name.
+  getKline({ symbol, interval, limit = 200, startTime, endTime, type }) {
     return this._get('/api/v1/futures/market/kline',
-      { symbol, interval, limit, startTime, endTime, klineType }, false);
+      { symbol, interval, limit, startTime, endTime, type }, false);
   }
 
   // GET /api/v1/futures/market/trading_pairs
@@ -316,14 +315,13 @@ export class BitunixClient {
   }
 
   // POST /api/v1/futures/trade/cancel_orders
-  cancelOrders({ symbol, orderList, marginCoin = this.marginCoin }) {
-    return this._post('/api/v1/futures/trade/cancel_orders', { symbol, orderList, marginCoin });
+  cancelOrders({ symbol, orderList }) {
+    return this._post('/api/v1/futures/trade/cancel_orders', { symbol, orderList });
   }
 
   // POST /api/v1/futures/trade/cancel_all_orders
-  cancelAllOrders({ symbol, marginCoin = this.marginCoin } = {}) {
-    return this._post('/api/v1/futures/trade/cancel_all_orders',
-      symbol ? { symbol, marginCoin } : { marginCoin });
+  cancelAllOrders({ symbol } = {}) {
+    return this._post('/api/v1/futures/trade/cancel_all_orders', symbol ? { symbol } : {});
   }
 
   // POST /api/v1/futures/trade/close_all_position
@@ -332,23 +330,21 @@ export class BitunixClient {
   }
 
   // POST /api/v1/futures/trade/flash_close_position
-  flashClosePosition(positionId, marginCoin = this.marginCoin) {
+  flashClosePosition(positionId) {
     return this._post('/api/v1/futures/trade/flash_close_position',
-      { positionId: String(positionId), marginCoin });
+      { positionId: String(positionId) });
   }
 
   // GET /api/v1/futures/trade/get_pending_orders
-  getPendingOrders({ symbol, orderId, clientId, status, startTime, endTime, skip = 0, limit = 50,
-    marginCoin = this.marginCoin } = {}) {
+  getPendingOrders({ symbol, orderId, clientId, status, startTime, endTime, skip = 0, limit = 50 } = {}) {
     return this._get('/api/v1/futures/trade/get_pending_orders',
-      { symbol, orderId, clientId, status, startTime, endTime, skip, limit, marginCoin });
+      { symbol, orderId, clientId, status, startTime, endTime, skip, limit });
   }
 
   // GET /api/v1/futures/trade/get_history_orders
-  getHistoryOrders({ symbol, orderId, clientId, status, type, startTime, endTime, skip = 0, limit = 20,
-    marginCoin = this.marginCoin } = {}) {
+  getHistoryOrders({ symbol, orderId, clientId, status, type, startTime, endTime, skip = 0, limit = 20 } = {}) {
     return this._get('/api/v1/futures/trade/get_history_orders',
-      { symbol, orderId, clientId, status, type, startTime, endTime, skip, limit, marginCoin });
+      { symbol, orderId, clientId, status, type, startTime, endTime, skip, limit });
   }
 
   // GET /api/v1/futures/trade/get_history_trades
