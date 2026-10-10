@@ -1,7 +1,7 @@
 import bitunix from '../exchange/bitunix.js';
 import { createLogger } from '../logger.js';
 import { orderGotFill, orderRejected } from '../exchange/errors.js';
-import { computeDynamicTpSl, computeMargin } from './risk.js';
+import { computeDynamicTpSl, computeMargin, clampStopInsideLiq } from './risk.js';
 import { applyPartialTpSl, entryMethod } from './tpsl.js';
 import { MAX_LEVERAGE } from '../settings-schema.js';
 import {
@@ -703,7 +703,60 @@ async function verifyStopApplied({ symbol, positionId, side, want, tries = 3 }) 
   return { ok: false, current };
 }
 
+/**
+ * Read the live position so a caller can omit `side`/`entry` and still get the
+ * guard. The AI tool's schema (src/ai/tools.js) has no `side` property at all,
+ * so every AI-initiated stop write arrived with side === undefined.
+ */
+async function livePositionContext(symbol, positionId) {
+  try {
+    const ps = await bitunix.getPendingPositions({ symbol });
+    const p = (Array.isArray(ps) ? ps : [])
+      .find((x) => String(x.positionId) === String(positionId));
+    if (!p) return null;
+    return {
+      side: p.side || null,
+      entry: Number(p.avgOpenPrice) || null,
+      liqPrice: Number(p.liqPrice) || null,
+    };
+  } catch { return null; }
+}
+
 export async function upsertPositionTpSl({ symbol, positionId, tpPrice, slPrice, side = null, entry = null, force = false }) {
+  // Resolve what the caller left out, from the position that actually exists.
+  //
+  // Without this the ratchet below was dead code on the AI path. `set_position_tpsl`
+  // in src/ai/tools.js declares no `side` property, so `side` arrived undefined,
+  // `side &&` short-circuited, and the guard never ran - while the tool's own
+  // description promised the user their hand-set stop was protected. Observed live
+  // 2026-10-10 06:31 on MAGICUSDT: a stop written with no side at all.
+  let live = null;
+  if (slPrice != null && !side) {
+    live = await livePositionContext(symbol, positionId);
+    if (live?.side) {
+      side = live.side;
+      log.info(`${symbol}: ratchet guard armed from the live position (side=${side}, entry=${live.entry}, liq=${live.liqPrice})`);
+    } else {
+      log.warn(`${symbol}: cannot resolve the side for position ${positionId} - the ratchet cannot run on this write`);
+    }
+    if (entry == null && live?.entry) entry = live.entry;
+  }
+
+  // A stop past the liquidation price never fires: the exchange liquidates first.
+  // risk.js states the rule ("clamp the stop inside liq, always") and the engine
+  // path enforces it, but this path did not - so an AI-chosen stop could sit
+  // beyond liq and the position would be liquidated rather than stopped out.
+  // This only ever moves a stop TIGHTER, never loosens, so it cannot cost more.
+  if (slPrice != null && side && Number(entry) > 0) {
+    const liq = live?.liqPrice;
+    if (liq != null && Number.isFinite(liq) && liq > 0) {
+      const c = clampStopInsideLiq({ side, entry: Number(entry), slPrice: Number(slPrice), liqPrice: liq });
+      if (c.adjusted) {
+        log.warn(`${symbol} ${side}: ${c.reason}`);
+        slPrice = c.slPrice;
+      }
+    }
+  }
   // ---- ratchet guard --------------------------------------------------
   //
   // The ratchet must compare against the level the EXCHANGE is holding, not
@@ -755,8 +808,18 @@ export async function upsertPositionTpSl({ symbol, positionId, tpPrice, slPrice,
       baseline = bestStop.get(key)?.stop ?? null;
     }
 
+    // A comparison needs a baseline we can trust. One read from the EXCHANGE is
+    // authoritative for this positionId, so it compares on its own. One taken
+    // from memory only compares when that memory is for the same side.
+    //
+    // Requiring `prev` in both cases was a second dead-code path, independent of
+    // the missing `side`: bestStop is empty on a cold start, after a restart,
+    // and whenever the agent is the first writer on a position - which is
+    // precisely the MAGICUSDT 06:31 case. The exchange baseline was fetched in
+    // full, then discarded unused while the loosening write went through.
     const prev = bestStop.get(key);
-    if (baseline != null && prev && prev.side === side) {
+    const canCompare = sawExchange || (prev != null && prev.side === side);
+    if (baseline != null && Number.isFinite(Number(baseline)) && canCompare) {
       const loosening = side === 'LONG' ? Number(slPrice) < Number(baseline) : Number(slPrice) > Number(baseline);
       if (loosening) {
         log.warn(`${symbol}: refusing to loosen the stop on a ${side} `
@@ -819,6 +882,18 @@ export async function upsertPositionTpSl({ symbol, positionId, tpPrice, slPrice,
 
     if (!rows.length) {
       return await finish('placed', await bitunix.placePositionTpSl(body));
+    }
+
+    // Carry an existing take-profit through an SL-only edit. The order-level
+    // fallback below already does this (`keepTp`), but the position-level modify
+    // did not, so a stop-only write left the target at the mercy of whatever the
+    // exchange does with an absent tpPrice. The trailing engine writes SL-only on
+    // every pass, so this is the common case, not an edge one - and losing the
+    // target is exactly the "cannot take profit" failure. Never invents a target
+    // that does not already exist; it only preserves one.
+    if (body.tpPrice == null) {
+      const existingTp = rows.find((r) => r.tpPrice != null)?.tpPrice;
+      if (existingTp != null) body.tpPrice = existingTp;
     }
 
     // 1) position-level modify (works when the stop was made by position/place_order)
