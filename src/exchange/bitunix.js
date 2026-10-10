@@ -601,5 +601,40 @@ export class BitunixClient {
   }
 }
 
+/**
+ * The exchange speaks BUY/SELL. The strategy engine speaks LONG/SHORT.
+ *
+ * Observed live 2026-10-10, NEARUSDT: the manage loop pulled a position whose
+ * `side` was "BUY", every `side === 'LONG'` test in trailingStop() was
+ * therefore false, and the LONG was handled with the SHORT branch throughout.
+ * The bot moved a winning long's stop to entry MINUS the fee buffer and
+ * announced it as "breakeven": a stop that books a loss. Reported entry
+ * 5.180000, stop written 5.1722300 = entry - 0.15%, i.e. -7.5% ROI at 50x.
+ *
+ * `normalized` marks rows that have been through here so callers can tell a
+ * converted value from one the exchange genuinely sent.
+ */
+export function normalizeSide(raw) {
+  const v = String(raw ?? '').trim().toUpperCase();
+  if (v === 'BUY' || v === 'LONG') return 'LONG';
+  if (v === 'SELL' || v === 'SHORT') return 'SHORT';
+  return null;
+}
+
+/**
+ * Apply normalizeSide to a position row in place, keeping the original under
+ * `exchangeSide` so nothing downstream can mistake one for the other.
+ */
+export function normalizePosition(p) {
+  if (!p || typeof p !== 'object') return p;
+  const side = normalizeSide(p.side ?? p.holdSide ?? p.positionSide);
+  if (side) {
+    p.exchangeSide = p.side ?? p.holdSide ?? p.positionSide ?? null;
+    p.side = side;
+    p.normalized = true;
+  }
+  return p;
+}
+
 export const bitunix = new BitunixClient();
 export default bitunix;

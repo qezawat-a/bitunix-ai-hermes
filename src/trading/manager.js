@@ -1,4 +1,4 @@
-import bitunix from '../exchange/bitunix.js';
+import bitunix, { normalizePosition } from '../exchange/bitunix.js';
 import { config } from '../config.js';
 import { createLogger } from '../logger.js';
 import { trailingStop, computeDynamicTpSl, stopAtrFor } from './risk.js';
@@ -67,8 +67,9 @@ export function positionRoi(p) {
 export async function livePositions() {
   const ps = await bitunix.getPendingPositions();
   if (!Array.isArray(ps)) return [];
-  return (ps || []).map((p) => ({
-    ...p,
+  // BUY/SELL from the exchange, LONG/SHORT for the engine. Without this the
+  // trailing engine read a long as a short - see normalizeSide in bitunix.js.
+  return (ps || []).map((p) => normalizePosition({ ...p,
     roi: positionRoi(p),
     // get_pending_positions returns `entryValue` — the exchange's own notional
     // figure (PositionPendingResp.entryValue). Prefer it over deriving from

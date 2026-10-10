@@ -1,4 +1,4 @@
-import bitunix from '../exchange/bitunix.js';
+import bitunix, { normalizeSide, normalizePosition } from '../exchange/bitunix.js';
 import { createLogger } from '../logger.js';
 import { orderGotFill, orderRejected } from '../exchange/errors.js';
 import { computeDynamicTpSl, computeMargin, clampStopInsideLiq } from './risk.js';
@@ -98,7 +98,10 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   await ensureSymbolConfig(symbol);
 
   const bal = await availableBalance();
-  const positions = await bitunix.getPendingPositions();
+  // Normalized for the same reason as livePositions(): the exchange returns
+  // BUY/SELL. Comparing that to 'LONG' silently never matches, so this guard
+  // could not see an existing position on the same symbol and side.
+  const positions = (await bitunix.getPendingPositions() || []).map((p) => normalizePosition({ ...p }));
   const openCount = (positions || []).length;
   if (openCount >= Number(s.max_open_positions)) {
     return { ok: false, reason: `max_open_positions reached (${openCount})` };
@@ -501,7 +504,8 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
     await new Promise((r) => setTimeout(r, 500));
     try {
       const ps = await bitunix.getPendingPositions({ symbol });
-      const match = (ps || []).find((p) => p.side === (isLong ? 'LONG' : 'SHORT'));
+      const match = (ps || []).map((p) => normalizePosition({ ...p }))
+        .find((p) => p.side === (isLong ? 'LONG' : 'SHORT'));
       if (match) positionId = match.positionId;
     } catch {}
   }
@@ -712,10 +716,11 @@ async function livePositionContext(symbol, positionId) {
   try {
     const ps = await bitunix.getPendingPositions({ symbol });
     const p = (Array.isArray(ps) ? ps : [])
+      .map((x) => normalizePosition({ ...x }))
       .find((x) => String(x.positionId) === String(positionId));
     if (!p) return null;
     return {
-      side: p.side || null,
+      side: normalizeSide(p.side) || null,
       entry: Number(p.avgOpenPrice) || null,
       liqPrice: Number(p.liqPrice) || null,
     };
