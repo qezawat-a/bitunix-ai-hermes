@@ -293,41 +293,55 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   // therefore blind to leverage AND to the size of the account, which is
   // exactly the two things that decide whether a trade can pay for itself.
   //
-  // On this account both are fatal. At 1.40 USDT the observed round-trip fee
-  // was 0.058 USDT - about 4% of the entire balance burned on entry and exit
-  // before a single point of profit. A strategy paying 4% per round trip has
-  // to win more than half its trades just to reach zero, and any edge smaller
-  // than that is negative no matter how good the signal was. Leverage makes
-  // this worse, not better: it scales the loss per unit of noise.
+  // On this account the fee is the binding constraint: at 1.40 USDT the
+  // observed round trip was 0.058 USDT on ~58 USDT of notional, so ~4% of the
+  // balance was burned entering and exiting before any profit existed.
   //
-  // So the cost is priced against the BALANCE, which is the only denominator
-  // that tells the truth here, and a trade is refused when it would burn more
-  // than `max_fee_pct_of_balance` of the account in fees alone. This is a
-  // statement about the account being too small for the strategy, not about
-  // any one signal being wrong - and it is deliberately logged loudly, because
-  // a bot that quietly stops opening positions looks identical to a bot that
-  // has found no opportunities.
+  // The first version of this check REFUSED any trade whose fee exceeded 1% of
+  // the balance. That was wrong, and it was mine: 1% of 1.40 USDT is 0.014,
+  // while the exchange's minimum round trip on these pairs is several times
+  // that, so the guard refused EVERY trade. It turned a risk control into a
+  // kill switch that looked like caution - the worst possible failure, because
+  // a bot that stops trading is indistinguishable from one that found no
+  // opportunities.
+  //
+  // The fix is to treat the fee as a SIZING budget rather than a gate. If the
+  // intended position costs too much to trade, the position gets SMALLER, and
+  // the trade still happens. That is what makes a small account work: the same
+  // edge, taken at a size where the fee cannot eat it.
+  //
+  //   fee        = notional * roundTripPct
+  //   notional   = margin * leverage
+  //   => max margin the fee budget allows = (balance * budget) / roundTripPct / leverage
+  //
+  // Only one thing still refuses: a position so small the exchange will not
+  // accept it (below minTradeVolume), which is a genuine "this account cannot
+  // trade this pair", not a policy choice.
   const roundTripPct = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
-  const nominalUsdt = Number(marginUsdt) * leverage;
   const balanceForCosts = Number(bal.available);
-  const maxFeePct = Number(s.max_fee_pct_of_balance ?? 1);
-  if (Number.isFinite(maxFeePct) && maxFeePct > 0 && balanceForCosts > 0 && nominalUsdt > 0) {
-    const feeUsdt = nominalUsdt * roundTripPct;
-    const feePctOfBalance = (feeUsdt / balanceForCosts) * 100;
-    if (feePctOfBalance > maxFeePct) {
-      await logEvent('position_refused_fee_floor', {
-        symbol, side: signal.side, leverage, marginUsdt: Number(marginUsdt),
-        nominalUsdt, feeUsdt, balance: balanceForCosts, feePctOfBalance, maxFeePct,
-        reason: 'round-trip cost exceeds the allowed share of the account',
-      }, symbol);
-      return {
-        ok: false,
-        reason: `refusing ${symbol}: a ${leverage}x position on ${nominalUsdt.toFixed(2)} USDT `
-          + `costs ~${feeUsdt.toFixed(4)} USDT in fees+slippage — ${feePctOfBalance.toFixed(2)}% `
-          + `of the ${balanceForCosts.toFixed(2)} USDT available, over the ${maxFeePct}% cap. `
-          + `The account is too small for this size; deposit, or lower max_open_positions/leverage.`,
-      };
+  // Share of the BALANCE one round trip may cost. Small by design: it is the
+  // margin of safety that keeps profit larger than cost.
+  const feeBudgetPct = Number(s.max_fee_pct_of_balance ?? 0.5);
+  if (Number.isFinite(feeBudgetPct) && feeBudgetPct > 0
+      && balanceForCosts > 0 && roundTripPct > 0 && leverage > 0) {
+    const maxNotional = (balanceForCosts * (feeBudgetPct / 100)) / roundTripPct;
+    const maxMarginAtLev = maxNotional / leverage;
+    if (marginUsdt > maxMarginAtLev) {
+      log.warn(`${symbol}: ${marginUsdt.toFixed(4)} USDT margin would cost `
+        + `${(marginUsdt * leverage * roundTripPct).toFixed(4)} USDT in fees `
+        + `(${(marginUsdt * leverage * roundTripPct / balanceForCosts * 100).toFixed(2)}% `
+        + `of balance, over the ${feeBudgetPct}% budget) — sizing down to `
+        + `${maxMarginAtLev.toFixed(4)} USDT margin`);
+      marginCapped = true;
+      marginUsdt = maxMarginAtLev;
     }
+  }
+  if (!(marginUsdt > 0)) {
+    return {
+      ok: false,
+      reason: `no viable size on ${symbol}: the ${feeBudgetPct}% fee budget of `
+        + `${balanceForCosts.toFixed(2)} USDT does not cover a minimum position at ${leverage}x`,
+    };
   }
 
   if (Number.isFinite(minCostMultiple) && minCostMultiple > 0 && atrAbs > 0) {
