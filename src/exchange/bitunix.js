@@ -231,7 +231,15 @@ export class BitunixClient {
         leverage: Number(t.leverage),
         mmr: Number(t.maintenanceMarginRate),
       }))
-      .filter((t) => Number.isFinite(t.mmr) && t.mmr > 0)
+      // A tier with mmr 0 is still a tier. Dropping it silently removed the
+      // FIRST band of any pair whose base tier carries no maintenance margin,
+      // which shifted every notional up a tier — a lower mmr and a higher
+      // leverage cap than the exchange actually applies, on exactly the thin
+      // pairs (NEARUSDT, USUSDT) this account trades. Only drop a row that has
+      // no usable range at all; mmr 0 is legal and means "no maintenance
+      // margin", which the liq maths handles.
+      .filter((t) => Number.isFinite(t.startValue) && Number.isFinite(t.endValue)
+        && t.endValue >= t.startValue)
       .sort((a, b) => a.startValue - b.startValue);
     if (!tiers.length) throw new Error(`no position tiers returned for ${symbol}`);
     this._tierCache.set(symbol, { at: Date.now(), tiers });
@@ -245,9 +253,19 @@ export class BitunixClient {
   async tierFor({ symbol, notional }) {
     const tiers = await this.positionTiers(symbol);
     const v = Number(notional) || 0;
-    return tiers.find((t) => v > t.startValue && v <= t.endValue)
-      || tiers.find((t) => v <= t.endValue)
-      || tiers[tiers.length - 1];
+    // Half-open bands, [startValue, endValue). The docs define tier N as
+    // startValue..endValue with the next tier starting exactly where it ends,
+    // so a position of exactly startValue belongs to the HIGHER tier. The
+    // comparison used to be `v > startValue`, which put every boundary value
+    // one tier too low — a lower maintenance margin rate and a higher leverage
+    // cap than the exchange grants, i.e. a liquidation price computed from
+    // worse numbers than the real ones. Both error directions matter here:
+    // overstating safety is what gets a position liquidated.
+    const exact = tiers.find((t) => v >= t.startValue && v < t.endValue);
+    if (exact) return exact;
+    // Above every band (should not happen, but never return a null tier) —
+    // the highest tier is the most conservative one available.
+    return tiers[tiers.length - 1];
   }
 
   // ------------------------------------------------------------------- trade
