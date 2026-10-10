@@ -39,6 +39,7 @@ export const NUMERIC = new Set([
   'reversal_confidence', 'breakeven_threshold', 'trailing_trigger_roi_pct',
   'trailing_distance_atr', 'trailing_lock_fraction', 'round_trip_fee_pct',
   'stop_slippage_pct', 'min_stop_cost_multiple', 'max_open_positions', 'liq_distance',
+  'max_margin_pct', 'max_fee_pct_of_balance',
   'dream_interval_hours',
 ]);
 
@@ -75,6 +76,8 @@ const RANGES = {
   round_trip_fee_pct: [0, 0.01],
   stop_slippage_pct: [0, 0.01],
   min_stop_cost_multiple: [0, 20],
+  max_margin_pct: [0.1, 100],
+  max_fee_pct_of_balance: [0.01, 50],
   max_open_positions: [1, 50],
   liq_distance: [0.05, 0.9],
   dream_interval_hours: [1, 720],

@@ -108,16 +108,62 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
     return { ok: false, reason: `already in ${signal.side} on ${symbol}` };
   }
 
-  const marginUsdt = marginOverride != null
-    ? Number(marginOverride)
-    : computeMargin({
-      available: bal.available,
-      marginPct: s.margin_pct,
-      openPositions: openCount,
-      maxPositions: Number(s.max_open_positions),
-    });
+  // ---- size the position ------------------------------------------------
+  //
+  // `computeMargin` is the only sizing rule in this codebase, and it commits
+  // `margin_pct` of the available balance, capped by the free slots.
+  //
+  // The AI judge can also propose a size (`margin_usdt` in its verdict), which
+  // used to REPLACE that computation outright with an unvalidated number. A
+  // model asked for a number has no reason to respect margin_pct, and on
+  // 2026-10-09 it proposed ~1.16 USDT against a 1.40 USDT account - 83% of the
+  // whole balance on one 50x position, from a setting that says 5%. The
+  // position history shows the fee that resulted: 0.058 USDT per round trip,
+  // i.e. ~58 USDT of notional, which is the tell.
+  //
+  // The proposal is now a REQUEST, not an instruction: it is clamped to the
+  // engine's own figure. Sizing is a risk decision, and the code that owns the
+  // risk rules is the only thing allowed to make it.
+  const engineMargin = computeMargin({
+    available: bal.available,
+    marginPct: s.margin_pct,
+    openPositions: openCount,
+    maxPositions: Number(s.max_open_positions),
+  });
+
+  let marginUsdt = engineMargin;
+  let marginRequested = null;
+  let marginCapped = false;
+  if (marginOverride != null) {
+    const asked = Number(marginOverride);
+    if (Number.isFinite(asked) && asked > 0) {
+      marginRequested = asked;
+      if (asked > engineMargin) {
+        marginCapped = true;
+        log.warn(`${symbol}: AI asked for ${asked.toFixed(4)} USDT margin, `
+          + `capping to ${engineMargin.toFixed(4)} (margin_pct ${s.margin_pct}% of `
+          + `${bal.available.toFixed(4)} available)`);
+      }
+    } else {
+      log.warn(`${symbol}: AI proposed an unusable margin (${marginOverride}); using the engine size`);
+    }
+  }
 
   if (!(marginUsdt > 0)) return { ok: false, reason: 'no available margin' };
+
+  // The account itself is a hard ceiling: no single position may risk more
+  // than this fraction of what is actually there, whatever asked for it.
+  const maxMarginPct = Number(s.max_margin_pct ?? 25);
+  if (Number.isFinite(maxMarginPct) && maxMarginPct > 0) {
+    const hardCap = (bal.available * maxMarginPct) / 100;
+    if (marginUsdt > hardCap) {
+      marginCapped = true;
+      log.warn(`${symbol}: margin ${marginUsdt.toFixed(4)} exceeds ${maxMarginPct}% of `
+        + `available (${hardCap.toFixed(4)}) — capping`);
+      marginUsdt = hardCap;
+    }
+  }
+  if (!(marginUsdt > 0)) return { ok: false, reason: `no margin left under the ${maxMarginPct}% per-trade cap` };
 
   // live price from tickers (mark price preferred)
   const tick = await bitunix.getTickers(symbol);
@@ -239,6 +285,51 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   // where it already was, i.e. a downgrade that fixed nothing.
   const minCostMultiple = Number(s.min_stop_cost_multiple ?? 3);
   const atrAbs = Math.abs(Number(signal?.atr) || 0);
+
+  // ---- the cost floor the ratio check above cannot see -----------------
+  //
+  // Every other guard in this file is expressed as a fraction of NOTIONAL:
+  // the stop as a % of price, the round trip as a % of price. Their ratio is
+  // therefore blind to leverage AND to the size of the account, which is
+  // exactly the two things that decide whether a trade can pay for itself.
+  //
+  // On this account both are fatal. At 1.40 USDT the observed round-trip fee
+  // was 0.058 USDT - about 4% of the entire balance burned on entry and exit
+  // before a single point of profit. A strategy paying 4% per round trip has
+  // to win more than half its trades just to reach zero, and any edge smaller
+  // than that is negative no matter how good the signal was. Leverage makes
+  // this worse, not better: it scales the loss per unit of noise.
+  //
+  // So the cost is priced against the BALANCE, which is the only denominator
+  // that tells the truth here, and a trade is refused when it would burn more
+  // than `max_fee_pct_of_balance` of the account in fees alone. This is a
+  // statement about the account being too small for the strategy, not about
+  // any one signal being wrong - and it is deliberately logged loudly, because
+  // a bot that quietly stops opening positions looks identical to a bot that
+  // has found no opportunities.
+  const roundTripPct = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
+  const nominalUsdt = Number(marginUsdt) * leverage;
+  const balanceForCosts = Number(bal.available);
+  const maxFeePct = Number(s.max_fee_pct_of_balance ?? 1);
+  if (Number.isFinite(maxFeePct) && maxFeePct > 0 && balanceForCosts > 0 && nominalUsdt > 0) {
+    const feeUsdt = nominalUsdt * roundTripPct;
+    const feePctOfBalance = (feeUsdt / balanceForCosts) * 100;
+    if (feePctOfBalance > maxFeePct) {
+      await logEvent('position_refused_fee_floor', {
+        symbol, side: signal.side, leverage, marginUsdt: Number(marginUsdt),
+        nominalUsdt, feeUsdt, balance: balanceForCosts, feePctOfBalance, maxFeePct,
+        reason: 'round-trip cost exceeds the allowed share of the account',
+      }, symbol);
+      return {
+        ok: false,
+        reason: `refusing ${symbol}: a ${leverage}x position on ${nominalUsdt.toFixed(2)} USDT `
+          + `costs ~${feeUsdt.toFixed(4)} USDT in fees+slippage — ${feePctOfBalance.toFixed(2)}% `
+          + `of the ${balanceForCosts.toFixed(2)} USDT available, over the ${maxFeePct}% cap. `
+          + `The account is too small for this size; deposit, or lower max_open_positions/leverage.`,
+      };
+    }
+  }
+
   if (Number.isFinite(minCostMultiple) && minCostMultiple > 0 && atrAbs > 0) {
     const stopPct = atrAbs / price;
     const roundTrip = Number(s.round_trip_fee_pct ?? 0.001) + Number(s.stop_slippage_pct ?? 0.0005);
@@ -425,6 +516,9 @@ export async function openFromSignal(signal, { aiVerdict = null, marginOverride 
   await logEvent('position_opened', {
     symbol, side: signal.side, qty, price, marginUsdt, leverage,
     leverageRequested, leverageApplied: leverage,
+    // How the size was actually decided, so a capped trade is distinguishable
+    // in the record from one that was sized this way to begin with.
+    marginRequested, marginApplied: Number(marginUsdt), marginCapped,
     marginMode, adjustments,
     tpPrice, slPrice, rr: risk.rr, confidence: signal.confidence,
     agreement: signal.agreement, orderId: res?.orderId, positionId,

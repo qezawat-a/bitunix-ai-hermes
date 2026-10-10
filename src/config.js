@@ -119,6 +119,12 @@ export const config = {
     position_mode: str(process.env.POSITION_MODE, 'HEDGE').toUpperCase(),      // HEDGE | ONE_WAY
     order_unit: str(process.env.ORDER_UNIT, 'COST').toUpperCase(),             // NOMINAL (position value) | COST (margin you commit) | QTY (base coin)
     margin_pct: num(process.env.MARGIN_PCT, 5),                                // % of available balance used as margin
+    // Hard ceiling on what ONE position may commit, regardless of anything
+    // else asking for it (including the AI judge). The 2026-10-09 losses came
+    // from positions sized at ~83% of a 1.40 USDT account; margin_pct says 5%
+    // but nothing enforced it. 25% leaves room for several positions and still
+    // stops any one of them being the whole account.
+    max_margin_pct: num(process.env.MAX_MARGIN_PCT, 25),
     symbols: str(process.env.SYMBOLS, 'AUTO'),                                 // AUTO = full pair list from exchange
     universe_rank: str(process.env.UNIVERSE_RANK, 'VOLUME').toUpperCase(),       // VOLUME | GAINERS | LOSERS | MOVERS
     universe_size: num(process.env.UNIVERSE_SIZE, 40),
@@ -158,6 +164,14 @@ export const config = {
     // than this, because a trail tighter than the round trip cannot pay.
     round_trip_fee_pct: num(process.env.ROUND_TRIP_FEE_PCT, 0.001),
     stop_slippage_pct: num(process.env.STOP_SLIPPAGE_PCT, 0.0005),
+    // Ceiling on what ONE round trip may cost as a share of the whole account.
+    // All the other cost checks are fractions of notional and so are blind to
+    // balance size; on a small account that blindness is the whole problem.
+    // Measured 2026-10-09: 0.058 USDT per round trip against a 1.40 USDT
+    // balance = 4.1% of the account burned before any profit. Set to 1, a
+    // normal 50x scalping position is refused outright at this balance, which
+    // is the correct answer - see the refusal message for what to change.
+    max_fee_pct_of_balance: num(process.env.MAX_FEE_PCT_OF_BALANCE, 1),
     // --- the four TP/SL methods (help centre id=290) ---
     tp_mode: str(process.env.TP_MODE, 'ADAPTIVE').toUpperCase(),                 // ADAPTIVE | FIXED_R
     tpsl_method: str(process.env.TPSL_METHOD, 'POSITION').toUpperCase(),       // POSITION | PARTIAL

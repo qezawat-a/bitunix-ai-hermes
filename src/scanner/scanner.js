@@ -516,13 +516,23 @@ export async function scan({ onlySymbols = null, persist = true } = {}) {
       if (sig.agreement < minAgree) rejectReason = `agreement ${sig.agreement} < ${minAgree}`;
       else if (sig.confidence < minConf) rejectReason = `confidence ${sig.confidence} < ${minConf}`;
       else {
+        // FAIL CLOSED: `blocked` is true both for a real cooldown and for an
+        // unreadable cooldown table. The second case must say so, or the
+        // operator sees a plausible clock time and assumes a normal cooldown.
         const cd = await isCoolingDown(sig.symbol);
-        if (cd) rejectReason = `cooldown until ${new Date(cd).toISOString().slice(11, 19)}`;
+        if (cd.blocked) {
+          rejectReason = cd.error
+            ? `cooldown check failed (${cd.error}) - refusing until the DB recovers`
+            : `cooldown until ${new Date(cd.until).toISOString().slice(11, 19)}`;
+        }
       }
 
       if (!rejectReason && confirmScans > 1) {
+        // null means the count is UNREADABLE, which is not "0 confirming
+        // scans" - it is "we cannot tell", and that has to block.
         const streak = await signalStreak(sig.symbol, sig.side, Math.max(2, cooldown));
-        if (streak + 1 < confirmScans) rejectReason = `needs ${confirmScans} confirming scans (have ${streak + 1})`;
+        if (streak == null) rejectReason = 'confirm-scan count unreadable - refusing';
+        else if (streak + 1 < confirmScans) rejectReason = `needs ${confirmScans} confirming scans (have ${streak + 1})`;
       }
 
       sig.rejectReason = rejectReason;

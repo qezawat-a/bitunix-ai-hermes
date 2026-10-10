@@ -127,7 +127,20 @@ export async function manageOpenPositions({ notify = null } = {}) {
   }
 
   // ---- book positions that disappeared (TP/SL hit or manual close) ----
-  for (const t of await openTrades()) {
+  //
+  // openTrades() throws on a DB error rather than returning [] — an empty list
+  // and an unreadable one are different facts, and conflating them silently
+  // skipped both the booking AND the setCooldown below, which is one of the two
+  // routes by which a stopped-out symbol could be re-entered immediately.
+  // Catch it HERE, at the read, so a failed read skips only this pass: the
+  // guard loop after it still runs and keeps live positions protected.
+  let stillOpen = [];
+  try {
+    stillOpen = await openTrades();
+  } catch (e) {
+    log.error(`cannot read open trades (${e.message}) — skipping the close-booking pass this round; live positions still guarded`);
+  }
+  for (const t of stillOpen) {
     if (!t.position_id || liveIds.has(String(t.position_id))) continue;
     try {
       const hist = await bitunix.getHistoryPositions({ positionId: t.position_id, limit: 1 });

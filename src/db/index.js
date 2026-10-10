@@ -191,7 +191,16 @@ export async function recentSignals(limit = 10) {
   return rows;
 }
 
-/** how many times the same symbol+side appeared in the last N minutes (confirm-scans) */
+/**
+ * How many times the same symbol+side appeared in the last N minutes.
+ *
+ * FAIL CLOSED. An unreadable count used to return 0, which reads as "this is
+ * the first confirming scan" - so a DB blip satisfied the confirmation
+ * requirement instead of blocking it. Returns null on failure; the caller
+ * must treat null as "cannot confirm, refuse".
+ *
+ * @returns {Promise<number|null>}
+ */
 export async function signalStreak(symbol, side, minutes = 5) {
   try {
   const { rows } = await q(
@@ -200,7 +209,10 @@ export async function signalStreak(symbol, side, minutes = 5) {
     [symbol, side, String(minutes)],
   );
   return rows[0].c;
-  } catch (e) { log.warn(`signalStreak failed: ${e.message}`); return 0; }
+  } catch (e) {
+    log.error(`signalStreak failed for ${symbol} (${e.message}) - treating as UNCONFIRMED`);
+    return null;
+  }
 }
 
 // -------------------------------------------------------------------- trades
@@ -233,11 +245,21 @@ export async function closeTrade({ positionId, exitPrice, realizedPnl, roiPct, r
   return rows[0] || null;
 }
 
+/**
+ * Trades the bot believes are still open.
+ *
+ * FAIL CLOSED. This used to return `[]` on a DB error, and `[]` is
+ * indistinguishable from "nothing is open" to the caller. That caller
+ * (manager.js) books exchange-side closes against this list and calls
+ * `setCooldown` there - so a failed read silently skipped both, and a symbol
+ * that had just been stopped out never entered its cooldown and could be
+ * re-entered immediately. Throwing is the only honest signal: the caller
+ * already catches per-trade errors, and a thrown read means "no closings
+ * booked this pass", never "the account is flat".
+ */
 export async function openTrades() {
-  try {
-    const { rows } = await q(`SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at DESC`);
-    return rows;
-  } catch (e) { log.warn(`openTrades failed: ${e.message}`); return []; }
+  const { rows } = await q(`SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at DESC`);
+  return rows;
 }
 
 export async function tradeByPosition(positionId) {
@@ -304,11 +326,38 @@ export async function setCooldown(symbol, minutes, reason = '') {
   } catch (e) { log.warn(`setCooldown failed: ${e.message}`); }
 }
 
+/**
+ * Is this symbol cooling down? Returns the `until` timestamp, or null if free.
+ *
+ * FAIL CLOSED. A failed DB read used to return `null`, which the caller read
+ * as "not cooling down" - so a database blip silently removed the cooldown and
+ * let the bot re-enter a symbol it had just been stopped out of. That is what
+ * happened on 2026-10-09: NEARUSDT closed at 22:00 and was re-entered at
+ * 22:02, well inside the 5-minute cooldown, and lost again. An unreadable
+ * safety net must read as "the net is up", never "no net".
+ *
+ * The failure result is a distinct `error` shape rather than a fake timestamp:
+ * a far-future `until` is truthy, so it blocks, but it would render in the
+ * reject message as an ordinary clock time and hide the real cause.
+ *
+ * @returns {{blocked: boolean, until: Date|null, error: string|null}}
+ */
 export async function isCoolingDown(symbol) {
   try {
     const { rows } = await q(`SELECT until FROM cooldowns WHERE symbol=$1 AND until > now()`, [symbol]);
-    return rows[0] ? rows[0].until : null;
-  } catch (e) { log.warn(`cooldown check failed: ${e.message}`); return null; }
+    return rows[0]
+      ? { blocked: true, until: rows[0].until, error: null }
+      : { blocked: false, until: null, error: null };
+  } catch (e) {
+    log.error(`cooldown check FAILED for ${symbol} (${e.message}) - treating as BLOCKED until the DB recovers`);
+    try {
+      await q(
+        `INSERT INTO agent_events (kind, symbol, payload) VALUES ('cooldown_check_failed',$1,$2::jsonb)`,
+        [symbol, JSON.stringify({ error: e.message })],
+      );
+    } catch { /* the DB is what just failed; the log line above is the record */ }
+    return { blocked: true, until: null, error: e.message };
+  }
 }
 
 export async function activeCooldowns() {

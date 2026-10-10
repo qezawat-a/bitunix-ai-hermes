@@ -190,11 +190,19 @@ async function test() {
   assert(writes[0].slPrice > 10000, `and the write carries the improved stop (${writes[0].slPrice})`);
 
   console.log('\nThe breakeven band moves the stop to entry, not past it');
-  // ROI of exactly breakeven_threshold (20): stop to entry + a fee buffer.
-  // pnl 20 on notional 100 at 25x -> 20 x 25 / 100 = 20%. Again 25x, so the
-  // clamp does not veto a stop sitting just above entry.
+  // ROI of exactly breakeven_threshold (20) and BELOW trailing_trigger_roi_pct
+  // (25), so breakeven is the half that owns this scenario.
+  //
+  // ROI = (pnl * leverage / notional) * 100, with notional = qty x entry = 0.01
+  // x 10000 = 100. For ROI 20 at 25x: pnl = 20 * 100 / (25 * 100) = 0.8.
+  // The old comment here wrote "20 x 25 / 100 = 20%", which is the arithmetic
+  // error this scenario was built on: 20 x 25 / 100 is 5, and the *100 that
+  // makes it a percentage is exactly what was dropped. The fixture asked for
+  // pnl 20 and got ROI 500% - twenty-five times past the trailing trigger - so
+  // the trailing engine answered (correctly) instead of breakeven, and the
+  // suite reported a broken guard while testing a trailing stop.
   pendingBook = [{ tpPrice: 12000, slPrice: 9900 }];
-  livePos = [mkPos({ unrealizedPNL: 20, markPrice: 10200, leverage: 25, liqPrice: 9600 })];
+  livePos = [mkPos({ unrealizedPNL: 0.8, markPrice: 10080, leverage: 25, liqPrice: 9600 })];
   reset();
   writes = [];
   const be = await pass();
