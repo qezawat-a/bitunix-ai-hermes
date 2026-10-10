@@ -485,6 +485,13 @@ export class BitunixClient {
     let cost;
     let nominal;
     switch (u) {
+      // Every branch also sets `budget`, the USDT actually committed to the
+      // position (qty x price / leverage). It was not tracked at all, so the
+      // fee budget and the margin cap in executor.js had to estimate it from
+      // `nominal / leverage`. That is only right when the exchange fills the
+      // quantity we asked for; after roundQty() the real cost is whatever the
+      // rounded quantity implies, and on a coarse-precision pair the two can
+      // differ by more than the margin being committed.
       case 'NOMINAL':
         nominal = a;
         cost = a / lev;
@@ -501,19 +508,46 @@ export class BitunixClient {
         cost = (a * px) / lev;
         break;
       default:
-        throw new Error(`unknown order unit "${unit}". Valid: NOMINAL, COST, QTY`);
+        // The exchange accepts NOMINAL_VALUE, COST_VALUE and QUANTITY as
+        // aliases, and `order_unit` is a free-text setting a user can set by
+        // hand. Falling through to COST on an unrecognised value meant a typo
+        // silently changed the size of a live order rather than stopping it.
+        // Matching a known alias keeps that setting forgiving; anything else is
+        // a genuine mistake and is refused.
+        if (['NOMINAL_VALUE', 'NOMINALVALUE'].includes(u.replace(/[\s-]/g, '_'))) {
+          nominal = a; cost = a / lev; qty = a / px;
+          break;
+        }
+        if (['COST_VALUE', 'COSTVALUE'].includes(u.replace(/[\s-]/g, '_'))) {
+          cost = a; nominal = a * lev; qty = (a * lev) / px;
+          break;
+        }
+        if (['QUANTITY', 'QUANTITY_UNIT'].includes(u.replace(/[\s-]/g, '_'))) {
+          qty = a; nominal = a * px; cost = (a * px) / lev;
+          break;
+        }
+        throw new Error(`unknown order unit "${unit}". Valid: NOMINAL, COST, QTY `
+          + `(aliases: NOMINAL_VALUE, COST_VALUE, QUANTITY)`);
     }
     const rounded = await this.roundQty(symbol, qty);
     // report the cost/nominal that the ROUNDED qty actually implies, not the
     // requested ones — rounding to basePrecision can move them materially on
     // a high-priced pair
     const effNominal = Number(rounded) * px;
+    const effCost = effNominal / lev;
+    // Rounding qty DOWN to the pair's basePrecision can leave the position
+    // smaller than asked, never larger - so effCost <= requested cost. That is
+    // the safe direction for a cost budget, and it is why the budget check uses
+    // this figure rather than the requested one.
     return {
       qty: rounded,
-      cost: effNominal / lev,
+      cost: effCost,
       nominal: effNominal,
       requestedCost: cost,
       requestedNominal: nominal,
+      // What the rounded quantity really costs, for callers that must not
+      // overstate the margin committed.
+      budgetUsdt: effCost,
       unit: u,
     };
   }
